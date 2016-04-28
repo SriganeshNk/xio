@@ -5,6 +5,7 @@ import com.xjeffrose.xio.core.ChannelStatistics;
 import com.xjeffrose.xio.core.ConnectionContextHandler;
 import com.xjeffrose.xio.core.ShutdownUtil;
 import com.xjeffrose.xio.core.XioExceptionLogger;
+import com.xjeffrose.xio.core.XioIdleDisconnectHandler;
 import com.xjeffrose.xio.core.XioMessageLogger;
 import com.xjeffrose.xio.core.XioMetrics;
 import com.xjeffrose.xio.core.XioSecurityHandlers;
@@ -19,6 +20,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
+import io.netty.channel.epoll.Epoll;
 import io.netty.channel.epoll.EpollEventLoopGroup;
 import io.netty.channel.epoll.EpollServerSocketChannel;
 import io.netty.channel.group.ChannelGroup;
@@ -26,7 +28,6 @@ import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
-import io.netty.handler.timeout.IdleStateHandler;
 import java.net.InetSocketAddress;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -38,8 +39,8 @@ import org.apache.log4j.Logger;
 public class XioServerTransport {
   private static final Logger log = Logger.getLogger(XioServerTransport.class.getName());
 
-  private static final int NO_WRITER_IDLE_TIMEOUT = 0;
-  private static final int NO_ALL_IDLE_TIMEOUT = 0;
+  private static final int NO_WRITER_IDLE_TIMEOUT = 60000;
+  private static final int NO_ALL_IDLE_TIMEOUT = 60000;
   private final int requestedPort;
   private final InetSocketAddress hostAddr;
   private final ChannelGroup allChannels;
@@ -52,8 +53,6 @@ public class XioServerTransport {
   private ExecutorService bossExecutor;
   private ExecutorService ioWorkerExecutor;
   private Channel serverChannel;
-//  private MultithreadEventLoopGroup bossGroup;
-//  private MultithreadEventLoopGroup workerGroup;
 
   public XioServerTransport(final XioServerDef def) {
     this(def, XioServerConfig.newBuilder().build(), new DefaultChannelGroup(new NioEventLoopGroup().next()));
@@ -70,7 +69,7 @@ public class XioServerTransport {
     this.hostAddr = def.getHostAddress();
     this.allChannels = allChannels;
     // connectionLimiter must be instantiated exactly once (and thus outside the pipeline factory)
-    final ConnectionLimiter connectionLimiter = new ConnectionLimiter(def.getMaxConnections());
+    final ConnectionLimiter connectionLimiter = new ConnectionLimiter(15000);
     this.channelStatistics = new ChannelStatistics(allChannels);
 
     //TODO(JR): This is an ugly mess, clean this up
@@ -80,7 +79,8 @@ public class XioServerTransport {
         ChannelPipeline cp = channel.pipeline();
         XioSecurityHandlers securityHandlers = def.getSecurityFactory().getSecurityHandlers(def, xioServerConfig);
         cp.addLast("connectionContext", new ConnectionContextHandler());
-        cp.addLast("connectionLimiter", connectionLimiter);
+        cp.addLast("globalConnectionLimiter", connectionLimiter);
+        cp.addLast("serviceConnectionLimiter", new ConnectionLimiter(def.getMaxConnections()));
         cp.addLast(ChannelStatistics.NAME, channelStatistics);
         cp.addLast("encryptionHandler", securityHandlers.getEncryptionHandler());
         cp.addLast("messageLogger", new XioMessageLogger());
@@ -88,15 +88,11 @@ public class XioServerTransport {
         cp.addLast("aggregator", def.getAggregatorFactory().getAggregator());
         cp.addLast("routingFilter", def.getRoutingFilterFactory().getRoutingFilter());
         if (def.getClientIdleTimeout() != null) {
-          cp.addLast("idleTimeoutHandler", new IdleStateHandler(
-              def.getClientIdleTimeout().toMillis(),
+          cp.addLast("idleDisconnectHandler", new XioIdleDisconnectHandler(
+              (int) def.getClientIdleTimeout().toMillis(),
               NO_WRITER_IDLE_TIMEOUT,
               NO_ALL_IDLE_TIMEOUT,
               TimeUnit.MILLISECONDS));
-          cp.addLast("idleDisconnectHandler", new IdleDisconnectHandler(
-              (int) def.getClientIdleTimeout().toMillis(),
-              NO_WRITER_IDLE_TIMEOUT,
-              NO_ALL_IDLE_TIMEOUT));
         }
         cp.addLast("authHandler", securityHandlers.getAuthenticationHandler());
         cp.addLast("dispatcher", new XioDispatcher(def, xioServerConfig));
@@ -111,7 +107,7 @@ public class XioServerTransport {
     ioWorkerExecutor = xioServerConfig.getWorkerExecutor();
     int ioWorkerThreadCount = xioServerConfig.getWorkerThreadCount();
 
-    if (System.getProperty("os.name") == "Linux1") {
+    if (Epoll.isAvailable()) {
       start(new EpollEventLoopGroup(bossThreadCount), new EpollEventLoopGroup(ioWorkerThreadCount));
     } else {
       start(new NioEventLoopGroup(bossThreadCount), new NioEventLoopGroup(ioWorkerThreadCount));
@@ -142,7 +138,7 @@ public class XioServerTransport {
     } catch (Throwable e) {
       //TODO(JR): Do somefin here
 //      e.printStackTrace();
-      String msg = e.getMessage() + " ("+hostAddr+")";
+      String msg = e.getMessage() + " (" + hostAddr + ")";
       log.error(msg, e);
       throw new RuntimeException(msg, e);
     }
@@ -168,14 +164,15 @@ public class XioServerTransport {
         .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
         .option(ChannelOption.WRITE_BUFFER_HIGH_WATER_MARK, 32 * 1024)
         .option(ChannelOption.WRITE_BUFFER_LOW_WATER_MARK, 8 * 1024)
-        .option(ChannelOption.TCP_NODELAY, true);
+        .option(ChannelOption.TCP_NODELAY, true)
+        .option(ChannelOption.SO_REUSEADDR, true);
 
     try {
       serverChannel = bootstrap.bind(hostAddr).sync().channel();
     } catch (Throwable e) {
       //TODO(JR): Do somefin here
 //      e.printStackTrace();
-      String msg = e.getMessage() + " ("+hostAddr+")";
+      String msg = e.getMessage() + " (" + hostAddr + ")";
       log.error(msg, e);
       throw new RuntimeException(msg, e);
     }
@@ -206,23 +203,6 @@ public class XioServerTransport {
       latch.await();
       serverChannel = null;
     }
-
-    // If the channelFactory was created by us, we should also clean it up. If the
-    // channelFactory was passed in by XioBootstrap, then it may be shared so don't clean
-    // it up.
-//    if (bossGroup != null) {
-//      ShutdownUtil.shutdownChannelFactory(bossGroup,
-//          bossExecutor,
-//          ioWorkerExecutor,
-//          allChannels);
-//    }
-//
-//    if (workerGroup != null) {
-//      ShutdownUtil.shutdownChannelFactory(workerGroup,
-//          bossExecutor,
-//          ioWorkerExecutor,
-//          allChannels);
-//    }
   }
 
   public Channel getServerChannel() {
