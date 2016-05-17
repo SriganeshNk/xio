@@ -21,10 +21,10 @@ import static com.google.common.base.Preconditions.checkState;
  */
 public class Distributor {
   private static final Logger log = Logger.getLogger(Distributor.class);
+
   private final ImmutableList<Node> pool;
   private final Map<UUID, Node> okNodes = new ConcurrentHashMap<>();
   private final Strategy strategy;
-//  private final Timer t = new Timer();
   private final XioTimer xioTimer;
   private final Timeout refreshTimeout;
 
@@ -86,14 +86,6 @@ public class Distributor {
    */
   public Node pick() {
     return strategy.getNextNode(pool, okNodes);
-  }
-
-  /**
-   * True if this distributor needs to be rebuilt. (For example, it may need to be updated with
-   * current availabilities.)
-   */
-  public boolean needsRebuild() {
-    return false;
   }
 
   /**

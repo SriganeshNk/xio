@@ -17,12 +17,14 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import org.apache.log4j.Logger;
 
 /**
  * The base type of nodes over which load is balanced. Nodes define the load metric that is used;
  * distributors like P2C will use these to decide where to balance the next connection request.
  */
 public class Node {
+  private static final Logger log = Logger.getLogger(Node.class);
 
   private final UUID token = UUID.randomUUID();
   private final ConcurrentHashMap<Channel, Stopwatch> pending = new ConcurrentHashMap<>();
@@ -64,8 +66,8 @@ public class Node {
     this.serviceName = n.serviceName;
   }
 
-  /**.
-   * The current host and port returned as a InetSocketAddress
+  /**
+   * . The current host and port returned as a InetSocketAddress
    */
   public static InetSocketAddress toInetAddress(HostAndPort hostAndPort) {
     return (hostAndPort == null) ? null : new InetSocketAddress(hostAndPort.getHostText(), hostAndPort.getPort());
@@ -93,7 +95,7 @@ public class Node {
   }
 
   public InetSocketAddress address() {
-    return (InetSocketAddress)address;
+    return (InetSocketAddress) address;
   }
 
   public void addPending(Channel channel) {
@@ -112,25 +114,34 @@ public class Node {
     RetryLoop retryLoop = new RetryLoop(new ExponentialBackoffRetry(200, 3, 500), new AtomicReference<TracerDriver>());
 
     while (retryLoop.shouldContinue()) {
-    try {
-      if (!connectionStopwatch.isRunning()) {
-        connectionStopwatch.start();
-      }
-      SocketChannel channel = SocketChannel.open();
-      channel.connect(address);
-      channel.close();
-      connectionStopwatch.stop();
-      connectionTimes.add(connectionStopwatch.elapsed(TimeUnit.MICROSECONDS));
-      connectionStopwatch.reset();
-      return true;
-    } catch (IOException e) {
       try {
-        retryLoop.takeException(e);
-      } catch (Exception e1) {
+        if (!connectionStopwatch.isRunning()) {
+          connectionStopwatch.start();
+        }
+        try (SocketChannel channel = SocketChannel.open()) {
+          channel.connect(address);
+        } catch (IOException e) {
+          try {
+            log.warn("Node is unreachable: Retrying " + address);
+            retryLoop.takeException(e);
+          } catch (Exception e1) {
+            log.error("Node has exceeded its max retry count" + address);
+            return false;
+          }
+          connectionStopwatch.stop();
+          connectionTimes.add(connectionStopwatch.elapsed(TimeUnit.MICROSECONDS));
+          connectionStopwatch.reset();
+          return true;
+      }
+
+      } catch (Exception e) {
+        //TODO(JR): Remove Me
+        log.error("Should never get here 1");
         return false;
       }
     }
-    }
+    //TODO(JR): Remove Me
+    log.error("Should never get here 2");
     return false;
   }
 
